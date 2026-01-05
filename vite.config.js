@@ -7,20 +7,21 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
-  registerType: "autoUpdate",
-  devOptions: {
-    enabled: true,
-  },
-  manifest: {
+      registerType: "autoUpdate",
+      devOptions: {
+        enabled: true,
+      },
+    manifest: {
     name: "Gastos Pareja",
     short_name: "Gastos",
-    start_url: "/",
+    start_url: "/proyecto-celu/",
+    scope: "/proyecto-celu/",
     display: "standalone",
     background_color: "#ffffff",
     theme_color: "#ffffff",
     icons: [
-      { src: "/pwa-192.png", sizes: "192x192", type: "image/png" },
-      { src: "/pwa-512.png", sizes: "512x512", type: "image/png" },
+      { src: "pwa-192.png", sizes: "192x192", type: "image/png" },
+      { src: "pwa-512.png", sizes: "512x512", type: "image/png" },
     ],
   },
 }),
