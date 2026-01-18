@@ -1,10 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { addEntry, deleteEntry, listEntries, listMonths, replaceAll } from "./api";
+import { getConfig, setConfig, registerDeviceProfile, addEntry, deleteEntry, listEntries, listMonths, replaceAll } from "./api";
+
+
 
 /* =========================================================
    1) CONFIG
    ========================================================= */
-const VIEWS = { PROFILE: "profile", ADD: "add", HISTORY: "history", MONTHS: "months", DEBUG: "debug" };
+const VIEWS = {
+  SETUP: "setup",
+  PROFILE: "profile",
+  ADD: "add",
+  SAVINGS: "savings",
+  FIXED: "fixed",
+  HISTORY: "history",
+  MONTHS: "months",
+  DEBUG: "debug",
+};
+
+
 const ENTRY_TYPES = { EXPENSE: "expense", INCOME: "income" };
 
 const PROFILES = [
@@ -13,19 +26,28 @@ const PROFILES = [
 ];
 
 const OPTIONS = {
-  categories: ["Comida", "Transporte", "Casa", "Salud", "Panorama", "Otros"],
+  // fallback local si Config aún no carga
+  categories: ["Comida", "Casa", "Personal", "Citas", "Locomoción", "Familia", "Salud", "Otros"],
   incomeCategories: ["Sueldo", "Transferencia", "Reembolso", "Regalo", "Venta", "Otros"],
 };
+
 
 // Preferencias locales (no son “la BD”; la BD es Google Sheets)
 const STORAGE = {
   themeKey: "gp_theme_v1",
   profileKey: "gp_profile_v1",
+  deviceIdKey: "gp_device_id_v1",
+  adminKey: "gp_admin_v1",
 };
 
+
 function uid() {
-  return crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
+  try {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  } catch {}
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
+
 
 // Fecha LOCAL (no UTC) para evitar “mañana” por desfase horario
 function todayISODateLocal() {
@@ -85,6 +107,28 @@ function saveProfile(p) {
   localStorage.setItem(STORAGE.profileKey, p);
 }
 
+function loadDeviceId() {
+  let id = localStorage.getItem(STORAGE.deviceIdKey);
+  if (id && id.length >= 8) return id;
+  id = uid();
+  localStorage.setItem(STORAGE.deviceIdKey, id);
+  return id;
+}
+
+function shortId(id) {
+  const s = String(id || "");
+  return s.length > 10 ? `${s.slice(0, 6)}…${s.slice(-4)}` : s;
+}
+
+function loadAdmin() {
+  return localStorage.getItem(STORAGE.adminKey) === "1";
+}
+
+function saveAdmin(v) {
+  localStorage.setItem(STORAGE.adminKey, v ? "1" : "0");
+}
+
+
 /* =========================================================
    2) Normalización (para importar JSON y legacy)
    ========================================================= */
@@ -101,8 +145,9 @@ function normalizeEntry(raw) {
   let type = raw?.type;
   if (type !== ENTRY_TYPES.INCOME && type !== ENTRY_TYPES.EXPENSE) type = ENTRY_TYPES.EXPENSE;
 
-  const validCats = type === ENTRY_TYPES.INCOME ? OPTIONS.incomeCategories : OPTIONS.categories;
-  const category = validCats.includes(raw?.category) ? raw.category : "Otros";
+  // No bloqueamos por catálogo local (la fuente real es Config en la nube).
+  // Si viene vacío, usamos "Otros".
+  const category = String(raw?.category || "").trim() || "Otros";
 
   const amount = Number(raw?.amount || 0);
 
@@ -192,26 +237,71 @@ export default function App() {
   const today = todayISODateLocal();
   const currentMonth = monthKeyFromISODate(today);
 
-  const [view, setView] = useState(VIEWS.PROFILE);
+  const [view, setView] = useState(VIEWS.SETUP);
+
 
   // Preferencias locales
+  // Preferencias locales
   const [theme, setTheme] = useState(loadTheme);
+
+  // Identidad del dispositivo (local) + admin local (solo para debug)
+  const [deviceId] = useState(loadDeviceId);
+  const [adminUnlocked, setAdminUnlocked] = useState(loadAdmin);
+
+  // Perfil efectivo (se “bloquea” por dispositivo cuando existe en la nube)
   const [profileId, setProfileId] = useState(loadProfile);
+  const [profileLocked, setProfileLocked] = useState(false);
 
   // Nube
   const [allEntries, setAllEntries] = useState([]);
   const [monthsFromCloud, setMonthsFromCloud] = useState([]);
   const [selectedMonth, setSelectedMonth] = useState(currentMonth);
   const [loading, setLoading] = useState(false);
+  const [booting, setBooting] = useState(false);   // fase rápida (config + perfil)
+  const [syncing, setSyncing] = useState(false);   // fase pesada (months + entries)
   const [err, setErr] = useState("");
   const [lastSyncAt, setLastSyncAt] = useState("");
+
+  // Config nube
+  const [config, setConfigState] = useState(null);
+
+  // Gastos fijos (editor)
+  const [fixedEditingId, setFixedEditingId] = useState("");
+  const [fixedDesc, setFixedDesc] = useState("");
+  const [fixedKind, setFixedKind] = useState("expense"); // "expense" | "goal"
+  const [fixedCategory, setFixedCategory] = useState("");
+  const [fixedGoalId, setFixedGoalId] = useState("");
+  const [fixedAmount, setFixedAmount] = useState("");
+  const [fixedAffects, setFixedAffects] = useState("both"); // "pablo" | "maria_ignacia" | "both"
+
 
   // Form (por defecto: gasto + fecha hoy)
   const [entryType, setEntryType] = useState(ENTRY_TYPES.EXPENSE);
   const [amount, setAmount] = useState("");
   const [category, setCategory] = useState(OPTIONS.categories[0]);
   const [date, setDate] = useState(today);
-  const [note, setNote] = useState("");
+    const [note, setNote] = useState("");
+
+  // Ahorro (Objetivos)
+  const [savingGoalId, setSavingGoalId] = useState("");
+  const [savingDir, setSavingDir] = useState("in"); // in | out
+  const [savingAmount, setSavingAmount] = useState("");
+  const [savingNote, setSavingNote] = useState("");
+
+  // Gastos fijos (Config.fixedItems)
+  const [fixedDraft, setFixedDraft] = useState({
+    id: "",
+    name: "",
+    category: "Casa",
+    amount: "",
+    scope: "shared",        // shared | personal
+    appliesTo: "both",      // pablo | maria_ignacia | both
+    account: "balance",     // balance | personal | goal:<id>
+    impactKey: "Casa",
+  });
+  const [editingFixedId, setEditingFixedId] = useState("");
+
+
 
   // Menu
   const [menuOpen, setMenuOpen] = useState(false);
@@ -234,12 +324,19 @@ export default function App() {
   }, [profileId]);
 
   useEffect(() => {
+    saveAdmin(adminUnlocked);
+  }, [adminUnlocked]);
+
+  // (eliminado: ya lo hace quickSync() abajo)
+
+
+  useEffect(() => {
     if (didInitRef.current) return;
     didInitRef.current = true;
-    refreshAll();
+    quickSync();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
+  
   useEffect(() => {
     if (!menuOpen) return;
     function onDown(e) {
@@ -256,33 +353,124 @@ export default function App() {
     };
   }, [menuOpen]);
 
-  // Asegurar categoría válida cuando cambia tipo
+  // (Se elimina este bloque duplicado)
+
+  // Asegurar categoría válida cuando cambia tipo / perfil / config
+  function getExpenseCats_(cfg) {
+    const v2 = cfg?.expenseCategoriesV2;
+    const v1 = cfg?.expenseCategories;
+    const list =
+      Array.isArray(v2) && v2.length ? v2 :
+      Array.isArray(v1) && v1.length ? v1 :
+      OPTIONS.categories;
+
+    // asegurar "Otros"
+    return list.includes("Otros") ? list : [...list, "Otros"];
+  }
+
+  function getIncomeCats_(cfg, pid) {
+    const byProfile = cfg?.incomeCategoriesByProfile?.[pid];
+    const v1 = cfg?.incomeCategories;
+    const list =
+      Array.isArray(byProfile) && byProfile.length ? byProfile :
+      Array.isArray(v1) && v1.length ? v1 :
+      OPTIONS.incomeCategories;
+
+    // asegurar "Otros"
+    return list.includes("Otros") ? list : [...list, "Otros"];
+  }
+
+  // Asegurar categoría válida cuando cambia tipo/config/perfil
   useEffect(() => {
-    const list = entryType === ENTRY_TYPES.INCOME ? OPTIONS.incomeCategories : OPTIONS.categories;
+    const expenseCats = getExpenseCats_(config);
+    const incomeCats = getIncomeCats_(config, profileId);
+    const list = entryType === ENTRY_TYPES.INCOME ? incomeCats : expenseCats;
     if (!list.includes(category)) setCategory(list[0] || "Otros");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entryType]);
+  }, [entryType, config, category, profileId]);
 
   /* ---------- Cloud ---------- */
-  async function refreshAll() {
-    setLoading(true);
+
+  // 1) Bootstrap: solo config + decidir perfil/bloqueo (rápido)
+  async function bootstrap() {
     setErr("");
+    setBooting(true);
     try {
-      const [items, ms] = await Promise.all([listEntries(""), listMonths()]);
-      setAllEntries(items);
-      setMonthsFromCloud(ms);
-      // Asegurar que el mes seleccionado exista en el listado visual (aunque no haya datos)
-      const combined = new Set([currentMonth, ...ms]);
-      if (!combined.has(selectedMonth)) setSelectedMonth(currentMonth);
+      const cfg = await getConfig();
+      setConfigState(cfg);
+
+      const assigned = cfg?.devices?.[deviceId];
+
+      if (assigned && PROFILES.some((p) => p.id === assigned)) {
+        setProfileId(assigned);
+        setProfileLocked(true);
+        setView((v) => (v === VIEWS.SETUP ? VIEWS.PROFILE : v));
+      } else {
+        setProfileLocked(false);
+        setView((v) => (v === VIEWS.DEBUG ? v : VIEWS.SETUP));
+      }
+
       setLastSyncAt(new Date().toISOString());
+      return cfg;
     } catch (e) {
       setErr(e?.message || String(e));
+      return null;
+    } finally {
+      setBooting(false);
+    }
+  }
+
+  // 2) Full sync: months + entries (pesado)
+  async function fullSync() {
+    setErr("");
+    setSyncing(true);
+    try {
+      const [ms, items] = await Promise.all([listMonths(), listEntries("")]);
+      setMonthsFromCloud(ms);
+      setAllEntries(items);
+
+      const combined = new Set([currentMonth, ...ms]);
+      if (!combined.has(selectedMonth)) setSelectedMonth(currentMonth);
+
+      setLastSyncAt(new Date().toISOString());
+      return true;
+    } catch (e) {
+      setErr(e?.message || String(e));
+      return false;
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  // Quick sync: NO espera fullSync (para que aparezca el perfil rápido)
+  async function quickSync() {
+    setLoading(true);
+    try {
+      const cfg = await bootstrap();
+      if (cfg) fullSync(); // background
     } finally {
       setLoading(false);
     }
   }
 
-  function go(to) {
+  // Sync completo: SÍ espera fullSync (para botón "Sincronizar" o después de guardar)
+  async function syncAll() {
+    setLoading(true);
+    try {
+      const cfg = await bootstrap();
+      if (cfg) await fullSync();
+    } finally {
+      setLoading(false);
+    }
+  }
+
+    function go(to) {
+    // Si el dispositivo no está asignado, no dejamos usar la app (salvo Setup/Debug)
+    if (!profileLocked && to !== VIEWS.SETUP && to !== VIEWS.DEBUG) {
+      setView(VIEWS.SETUP);
+      setMenuOpen(false);
+      return;
+    }
+
     setView(to);
     setMenuOpen(false);
 
@@ -292,9 +480,19 @@ export default function App() {
       setDate(todayISODateLocal());
       setAmount("");
       setNote("");
-      setCategory(OPTIONS.categories[0]);
+      setCategory(getExpenseCats_(config)[0] || "Otros");
+    }
+
+    if (to === VIEWS.SAVINGS) {
+      setSavingDir("in");
+      setSavingAmount("");
+      setSavingNote("");
+      const goals = config?.goalsByProfile?.[profileId] || [];
+      setSavingGoalId(goals?.[0]?.id || "");
     }
   }
+
+
 
   function toggleTheme() {
     setTheme((t) => (t === "light" ? "dark" : "light"));
@@ -307,20 +505,379 @@ export default function App() {
     [allEntries, selectedMonth]
   );
 
-  const myEntriesMonth = useMemo(
-    () => entriesMonth.filter((e) => e.profile === profileId),
-    [entriesMonth, profileId]
-  );
+  const myGoals = useMemo(() => {
+    const list = config?.goalsByProfile?.[profileId];
+    return Array.isArray(list) ? list : [];
+  }, [config, profileId]);
+
+  const fixedItems = useMemo(() => {
+    const list = config?.fixedItems;
+    return Array.isArray(list) ? list : [];
+  }, [config]);
+
+  async function setConfigCloud(nextConfig) {
+    await setConfig(nextConfig); // api.js: POST setConfig
+    const fresh = await getConfig();
+    setConfigState(fresh);
+  }
+
+  function impactKeyForGoal_(goal) {
+    if (!goal || goal.scope !== "shared") return "";
+    // alineado a tu config.sharedImpactKeys
+    if (goal.id === "vacaciones") return "Vacaciones";
+    if (goal.id === "delosdos") return "DeLosDos";
+    // fallback razonable
+    return String(goal.name || "");
+  }
+
+  async function refreshAll() {
+    // ya tenemos config, así que solo refrescamos data pesada
+    await fullSync();
+  }
+
+  const goalStats = useMemo(() => {
+
+    const byId = new Map();
+
+    for (const g of myGoals) {
+      byId.set(g.id, {
+        id: g.id,
+        name: g.name,
+        scope: g.scope,
+        monthIn: 0,
+        monthOut: 0,
+        allIn: 0,
+        allOut: 0,
+      });
+    }
+
+    for (const e of allEntries) {
+      if (String(e?.nature || "") !== "saving") continue;
+
+      const acc = String(e?.account || "");
+      if (!acc.startsWith("goal:")) continue;
+
+      const goalId = acc.slice("goal:".length);
+      const st = byId.get(goalId);
+      if (!st) continue;
+
+      const amt = Number(e?.amount || 0);
+      if (!Number.isFinite(amt) || amt <= 0) continue;
+
+      const dir = String(e?.direction || "");
+      const isIn = dir === "in" || e.type === "income";
+      const isOut = dir === "out" || e.type === "expense";
+
+      if (isIn) st.allIn += amt;
+      if (isOut) st.allOut += amt;
+
+      if (monthKeyFromISODate(e.date) === selectedMonth) {
+        if (isIn) st.monthIn += amt;
+        if (isOut) st.monthOut += amt;
+      }
+    }
+
+    return [...byId.values()].map((s) => ({
+      ...s,
+      monthBalance: s.monthIn - s.monthOut,
+      allBalance: s.allIn - s.allOut,
+    }));
+  }, [allEntries, myGoals, selectedMonth]);
+
+  async function onSubmitSaving(ev) {
+    ev.preventDefault();
+
+    const goal = myGoals.find((g) => g.id === savingGoalId);
+    if (!goal) return alert("Selecciona un objetivo.");
+
+    const amt = parseAmount(savingAmount);
+    if (!amt) return alert("Monto inválido.");
+
+    const dir = savingDir === "out" ? "out" : "in";
+    const type = dir === "in" ? ENTRY_TYPES.INCOME : ENTRY_TYPES.EXPENSE;
+
+    const entry = {
+      id: uid(),
+      type,
+      amount: amt,
+      category: String(goal.name || "Ahorro"),
+      profile: profileId,
+      date: todayISODateLocal(),
+      note: String(savingNote || "").trim(),
+      split: null,
+      createdAt: new Date().toISOString(),
+
+      // NUEVO: esquema extendido
+      nature: "saving",
+      scope: goal.scope === "shared" ? "shared" : "personal",
+      account: `goal:${goal.id}`,
+      direction: dir,
+      impactKey: impactKeyForGoal_(goal) || "",
+      fixedId: "",
+      meta: "",
+    };
+
+    setLoading(true);
+    setErr("");
+    try {
+      await addEntry(entry);
+      await refreshAll();
+      go(VIEWS.SAVINGS);
+      setSavingAmount("");
+      setSavingNote("");
+    } catch (e) {
+      setErr(e?.message || String(e));
+      alert("Error guardando ahorro: " + (e?.message || String(e)));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function resetFixedDraft_() {
+    setFixedDraft({
+      id: "",
+      name: "",
+      category: "Casa",
+      amount: "",
+      scope: "shared",
+      appliesTo: "both",
+      account: "balance",
+      impactKey: "Casa",
+    });
+    setEditingFixedId("");
+  }
+
+  async function onSaveFixedItem(ev) {
+    ev.preventDefault();
+
+    const id = String(fixedDraft.id || "").trim() || `fx_${uid().slice(0, 8)}`;
+    const name = String(fixedDraft.name || "").trim();
+    if (!name) return alert("Falta Descripción.");
+
+    const amount = parseAmount(fixedDraft.amount);
+    if (!amount) return alert("Monto inválido.");
+
+    const category = String(fixedDraft.category || "Casa").trim() || "Casa";
+    const scope = fixedDraft.scope === "personal" ? "personal" : "shared";
+    const appliesTo = ["pablo", "maria_ignacia", "both"].includes(fixedDraft.appliesTo) ? fixedDraft.appliesTo : "both";
+    const account = String(fixedDraft.account || "balance").trim() || "balance";
+    const impactKey = scope === "shared" ? String(fixedDraft.impactKey || "").trim() : "";
+
+    const next = {
+      ...(config || {}),
+      fixedItems: (Array.isArray(config?.fixedItems) ? config.fixedItems : []).filter((x) => String(x?.id) !== String(id)).concat([{
+        id,
+        name,
+        category,
+        amount,
+        scope,
+        appliesTo,
+        account,
+        impactKey,
+      }]),
+    };
+
+    setLoading(true);
+    try {
+      await setConfigCloud(next);
+      resetFixedDraft_();
+      alert("Gasto fijo guardado.");
+    } catch (e) {
+      alert("Error guardando gasto fijo: " + (e?.message || String(e)));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function onEditFixedItem(item) {
+    setEditingFixedId(String(item.id || ""));
+    setFixedDraft({
+      id: String(item.id || ""),
+      name: String(item.name || ""),
+      category: String(item.category || "Casa"),
+      amount: String(item.amount || ""),
+      scope: item.scope === "personal" ? "personal" : "shared",
+      appliesTo: item.appliesTo || "both",
+      account: String(item.account || "balance"),
+      impactKey: String(item.impactKey || "Casa"),
+    });
+  }
+
+  async function onDeleteFixedItem(id) {
+    if (!confirm("¿Eliminar este gasto fijo?")) return;
+
+    const next = {
+      ...(config || {}),
+      fixedItems: (Array.isArray(config?.fixedItems) ? config.fixedItems : []).filter((x) => String(x?.id) !== String(id)),
+    };
+
+    setLoading(true);
+    try {
+      await setConfigCloud(next);
+      if (editingFixedId === id) resetFixedDraft_();
+    } catch (e) {
+      alert("Error eliminando gasto fijo: " + (e?.message || String(e)));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function entryKey_(e) {
+    const scope = String(e?.scope || "") === "shared" ? "shared" : "personal";
+    const p = scope === "shared" ? "*" : String(e?.profile || "");
+    return `${p}|${e.date}|${e.fixedId}|${e.amount}|${e.category}|${e.nature}|${e.account}|${e.direction}`;
+  }
+
+
+  async function onGenerateFixedForMonth() {
+    if (!selectedMonth) return;
+
+    const month = selectedMonth;
+    const targets = fixedItems || [];
+    if (!targets.length) return alert("No hay gastos fijos configurados.");
+
+    // evitar duplicados por fixedId + month (usamos meta.month)
+    const existing = allEntries.filter((e) => String(e.fixedId || "") && (e.date || "").slice(0, 7) === month);
+    const existingSet = new Set(existing.map(entryKey_));
+
+    const today = todayISODateLocal();
+    const date = `${month}-01`;
+
+    const created = [];
+
+    for (const fx of targets) {
+      const applies = fx.appliesTo || "both";
+      const scope = fx.scope === "personal" ? "personal" : "shared";
+
+      // Para shared: 1 sola fila (dueño canónico) para no duplicar sumas.
+      // Si especifica un perfil, úsalo; si dice both, usa "pablo" como canónico.
+      const profiles =
+        scope === "shared"
+          ? [applies === "maria_ignacia" ? "maria_ignacia" : "pablo"]
+          : (applies === "pablo"
+              ? ["pablo"]
+              : applies === "maria_ignacia"
+                ? ["maria_ignacia"]
+                : ["pablo", "maria_ignacia"]);
+
+
+      for (const pid of profiles) {
+        const scope = fx.scope === "personal" ? "personal" : "shared";
+        const impactKey = scope === "shared" ? String(fx.impactKey || fx.category || "") : "";
+
+        const entry = {
+          id: uid(),
+          type: ENTRY_TYPES.EXPENSE,
+          amount: Number(fx.amount || 0),
+          category: String(fx.category || "Casa"),
+          profile: pid,
+          date,
+          note: `Gasto fijo: ${fx.name}`,
+          split: null,
+          createdAt: new Date().toISOString(),
+
+          nature: "fixed",
+          scope,
+          account: String(fx.account || "balance"),
+          direction: "out",
+          impactKey,
+          fixedId: String(fx.id || ""),
+          meta: JSON.stringify({ month }),
+        };
+
+        if (!entry.amount || entry.amount <= 0) continue;
+
+        const k = entryKey_(entry);
+        if (existingSet.has(k)) continue;
+
+        created.push(entry);
+        existingSet.add(k);
+      }
+    }
+
+    if (!created.length) return alert("No hay cargos nuevos para generar (ya estaban).");
+
+    setLoading(true);
+    try {
+      for (const e of created) {
+        await addEntry(e);
+      }
+      await syncAll();
+      alert(`Generados: ${created.length} cargos fijos para ${month}.`);
+    } catch (e) {
+      alert("Error generando cargos: " + (e?.message || String(e)));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function onMoveGoalToBalance(goalId) {
+    const goal = myGoals.find((g) => g.id === goalId);
+    if (!goal) return;
+
+    const amt = parseAmount(prompt(`¿Cuánto mover desde "${goal.name}" a Balance General? (CLP)`));
+    if (!amt) return;
+
+    const entry = {
+      id: uid(),
+      type: ENTRY_TYPES.EXPENSE,
+      amount: amt,
+      category: String(goal.name || "Ahorro"),
+      profile: profileId,
+      date: todayISODateLocal(),
+      note: "Mover a Balance General",
+      split: null,
+      createdAt: new Date().toISOString(),
+
+      nature: "saving",
+      scope: goal.scope === "shared" ? "shared" : "personal",
+      account: `goal:${goal.id}`,
+      direction: "out",
+      impactKey: impactKeyForGoal_(goal) || "",
+      fixedId: "",
+      meta: JSON.stringify({ moveTo: "balance" }),
+    };
+
+    setLoading(true);
+    setErr("");
+    try {
+      await addEntry(entry);
+      await refreshAll();
+      go(VIEWS.SAVINGS);
+    } catch (e) {
+      setErr(e?.message || String(e));
+      alert("Error moviendo a balance: " + (e?.message || String(e)));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+const myEntriesMonth = useMemo(
+  () => entriesMonth.filter((e) => e.profile === profileId || String(e?.scope || "") === "shared"),
+  [entriesMonth, profileId]
+);
 
   const myExpensesMonth = useMemo(
-    () => myEntriesMonth.filter((e) => e.type === ENTRY_TYPES.EXPENSE),
+    () =>
+      myEntriesMonth.filter((e) => {
+        // mantener compatibilidad con legacy: si no hay nature, usar type
+        const nature = String(e?.nature || "");
+        if (nature) return nature === "expense" || nature === "fixed";
+        return e.type === ENTRY_TYPES.EXPENSE;
+      }),
     [myEntriesMonth]
   );
 
   const myIncomesMonth = useMemo(
-    () => myEntriesMonth.filter((e) => e.type === ENTRY_TYPES.INCOME),
+    () =>
+      myEntriesMonth.filter((e) => {
+        const nature = String(e?.nature || "");
+        if (nature) return nature === "income";
+        return e.type === ENTRY_TYPES.INCOME;
+      }),
     [myEntriesMonth]
   );
+
 
   const myIncomeTotal = useMemo(() => sumAmounts(myIncomesMonth), [myIncomesMonth]);
   const myExpenseTotal = useMemo(() => sumAmounts(myExpensesMonth), [myExpensesMonth]);
@@ -340,10 +897,23 @@ export default function App() {
   const myMaxCat = useMemo(() => Math.max(0, ...myTopExpenseCategories.map((x) => x.value)), [myTopExpenseCategories]);
 
   // Presupuestos de ejemplo (% del ingreso del mes por perfil)
+    // Presupuestos desde la nube (config.budgets) en % 0..100 => fracción 0..1
   const budgetPercents = useMemo(() => {
+    const fromCloud = config?.budgets?.[profileId];
+    if (fromCloud && typeof fromCloud === "object") {
+      const out = {};
+      for (const k of Object.keys(fromCloud)) {
+        const v = Number(fromCloud[k]);
+        if (Number.isFinite(v) && v >= 0) out[k] = v / 100;
+      }
+      return out;
+    }
+
+    // fallback (por si config aún no llega)
     if (profileId === "pablo") return { Casa: 0.35, Comida: 0.18, Transporte: 0.08, Panorama: 0.05, Salud: 0.03, Otros: 0.06 };
     return { Casa: 0.30, Comida: 0.20, Transporte: 0.08, Panorama: 0.06, Salud: 0.03, Otros: 0.06 };
-  }, [profileId]);
+  }, [profileId, config]);
+
 
   const spendByCat = useMemo(() => {
     const m = {};
@@ -398,7 +968,7 @@ export default function App() {
     for (const m of availableMonths) out.set(m, { income: 0, expense: 0 });
 
     for (const e of allEntries) {
-      if (e.profile !== profileId) continue;
+      if (e.profile !== profileId && String(e?.scope || "") !== "shared") continue;
       const m = monthKeyFromISODate(e.date);
       if (!out.has(m)) out.set(m, { income: 0, expense: 0 });
       const bucket = out.get(m);
@@ -425,8 +995,13 @@ export default function App() {
     const n = parseAmount(amount);
     if (n === null) return alert("Monto inválido (>0).");
 
-    const validCats = entryType === ENTRY_TYPES.INCOME ? OPTIONS.incomeCategories : OPTIONS.categories;
+    const validCats = entryType === ENTRY_TYPES.INCOME
+      ? getIncomeCats_(config, profileId)
+      : getExpenseCats_(config);
+
     if (!validCats.includes(category)) return alert("Categoría inválida.");
+
+
 
     const entry = {
       id: uid(),
@@ -444,7 +1019,7 @@ export default function App() {
     setErr("");
     try {
       await addEntry(entry);
-      await refreshAll();
+      await syncAll();
       setSelectedMonth(monthKeyFromISODate(entry.date));
       go(VIEWS.PROFILE);
     } catch (e2) {
@@ -461,7 +1036,7 @@ export default function App() {
     setErr("");
     try {
       await deleteEntry(id);
-      await refreshAll();
+      await syncAll();
     } catch (e) {
       setErr(e?.message || String(e));
       alert("Error eliminando: " + (e?.message || String(e)));
@@ -513,7 +1088,7 @@ export default function App() {
     setErr("");
     try {
       await replaceAll(normalized);
-      await refreshAll();
+      await syncAll();
       alert("Nube reemplazada ✅");
       go(VIEWS.PROFILE);
     } catch (e) {
@@ -524,7 +1099,12 @@ export default function App() {
     }
   }
 
-  const catList = entryType === ENTRY_TYPES.INCOME ? OPTIONS.incomeCategories : OPTIONS.categories;
+  const expenseCats = getExpenseCats_(config);
+  const incomeCats = getIncomeCats_(config, profileId);
+  const catList = entryType === ENTRY_TYPES.INCOME ? incomeCats : expenseCats;
+
+
+
 
   return (
     <>
@@ -541,11 +1121,11 @@ export default function App() {
             <div>
               <div className="kpiBig">Nube (Google Sheets)</div>
               <div className="kpiSmall">
-                Mes: <b>{selectedMonth}</b> · Perfil: <b>{profileName(profileId)}</b> · Tema: <b>{theme}</b>
+                Mes: <b>{selectedMonth}</b> · Perfil: <b>{profileLocked ? profileName(profileId) : "Sin asignar"}</b>{profileLocked ? " 🔒" : ""} · Dispositivo: <b>{shortId(deviceId)}</b> · Tema: <b>{theme}</b>
               </div>
             </div>
             <div style={{ textAlign: "right" }}>
-              <button className="secondaryBtn" onClick={refreshAll} disabled={loading}>
+              <button className="secondaryBtn" onClick={syncAll} disabled={loading}>
                 {loading ? "Sincronizando..." : "Sincronizar"}
               </button>
               <div className="small" style={{ marginTop: 6 }}>
@@ -554,6 +1134,76 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        {/* SETUP (primer uso por dispositivo) */}
+        {view === VIEWS.SETUP && (
+          <div className="grid">
+            <div className="card grid">
+              <div className="kpiBig">Configurar este celular</div>
+              <div className="meta" style={{ marginTop: 6 }}>
+                Este dispositivo aún no tiene perfil asignado en la nube.
+              </div>
+              <div className="small" style={{ marginTop: 8 }}>
+                DeviceId:{" "}
+                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                  {shortId(deviceId)}
+                </span>
+              </div>
+
+              <div className="adminActions" style={{ marginTop: 14 }}>
+                <button
+                  className="primary"
+                  type="button"
+                  disabled={loading}
+                  onClick={async () => {
+                    try {
+                      setLoading(true);
+                      await registerDeviceProfile({ deviceId, profile: "pablo" });
+                      await syncAll();
+                    } catch (e) {
+                      alert("Error asignando dispositivo: " + (e?.message || String(e)));
+                    } finally {
+                      setLoading(false);
+                    }
+                  }}
+                >
+                  Soy Pablo
+                </button>
+
+                <button
+                  className="primary"
+                  type="button"
+                  disabled={loading}
+                  onClick={async () => {
+                    try {
+                      setLoading(true);
+                      await registerDeviceProfile({ deviceId, profile: "maria_ignacia" });
+                      await syncAll();
+                    } catch (e) {
+                      alert("Error asignando dispositivo: " + (e?.message || String(e)));
+                    } finally {
+                      setLoading(false);
+                    }
+                  }}
+                >
+                  Soy Maria Ignacia
+                </button>
+
+                <button className="secondaryBtn" type="button" onClick={bootstrap} disabled={booting}>
+                  {booting ? "..." : "Reintentar (rápido)"}
+                </button>
+
+                <button className="secondaryBtn" type="button" onClick={() => go(VIEWS.DEBUG)}>
+                  Debug
+                </button>
+              </div>
+
+              <div className="small" style={{ marginTop: 10 }}>
+                Una vez asignado, el perfil queda bloqueado (solo admin puede cambiarlo desde Debug).
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* PERFIL */}
         {view === VIEWS.PROFILE && (
@@ -681,8 +1331,203 @@ export default function App() {
           </div>
         )}
 
+        {/* SAVINGS */}
+        {view === VIEWS.SAVINGS && (
+          <div className="grid">
+            <div className="card">
+              <div className="kpiBig">Ahorro (Objetivos)</div>
+              <div className="meta">
+                Perfil: <b>{profileName(profileId)}</b> · Mes: <b>{selectedMonth}</b>
+              </div>
+            </div>
+
+            {myGoals.length === 0 ? (
+              <div className="card">No hay objetivos configurados para este perfil.</div>
+            ) : (
+              <>
+                <div className="card grid">
+                  <div className="kpiBig">Registrar movimiento</div>
+
+                  <form onSubmit={onSubmitSaving} className="formGrid" style={{ marginTop: 10 }}>
+                    <label className="label span2">
+                      Objetivo
+                      <select className="select" value={savingGoalId} onChange={(e) => setSavingGoalId(e.target.value)}>
+                        {myGoals.map((g) => (
+                          <option key={g.id} value={g.id}>
+                            {g.name} {g.scope === "shared" ? "· (Compartido)" : "· (Personal)"}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="label">
+                      Tipo
+                      <select className="select" value={savingDir} onChange={(e) => setSavingDir(e.target.value)}>
+                        <option value="in">Aportar (+)</option>
+                        <option value="out">Gastar (-)</option>
+                      </select>
+                    </label>
+
+                    <label className="label">
+                      Monto (CLP) *
+                      <input className="input" inputMode="numeric" value={savingAmount} onChange={(e) => setSavingAmount(e.target.value)} />
+                    </label>
+
+                    <label className="label span2">
+                      Nota (opcional)
+                      <input className="input" value={savingNote} onChange={(e) => setSavingNote(e.target.value)} />
+                    </label>
+
+                    <div className="span2">
+                      <button className="primary" type="submit" disabled={loading}>
+                        {loading ? "Guardando..." : "Guardar"}
+                      </button>
+                    </div>
+                  </form>
+                </div>
+
+                {goalStats.map((g) => (
+                  <div key={g.id} className="rowCard">
+                    <div className="rowTop">
+                      <div className="money">{g.name} {g.scope === "shared" ? "🤝" : "👤"}</div>
+                      <div className="meta">Saldo total: <b>${formatCLP(g.allBalance)}</b></div>
+                    </div>
+
+                    <div className="meta">
+                      Mes: +${formatCLP(g.monthIn)} · -${formatCLP(g.monthOut)} · Saldo mes: <b>${formatCLP(g.monthBalance)}</b>
+                    </div>
+
+                    <div className="meta">
+                      Total: +${formatCLP(g.allIn)} · -${formatCLP(g.allOut)}
+                    </div>
+
+                    <button className="secondaryBtn" type="button" onClick={() => onMoveGoalToBalance(g.id)} disabled={loading}>
+                      Mover a Balance General
+                    </button>
+                  </div>
+                ))}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* FIXED */}
+        {view === VIEWS.FIXED && (
+          <div className="grid">
+            <div className="card">
+              <div className="kpiBig">Gastos fijos</div>
+              <div className="meta">
+                Se guardan en <b>Config.fixedItems</b> (nube). Mes actual: <b>{selectedMonth}</b>
+              </div>
+              <button className="secondaryBtn" onClick={onGenerateFixedForMonth} disabled={loading}>
+                Generar cargos del mes
+              </button>
+            </div>
+
+            <div className="card grid">
+              <div className="kpiBig">{editingFixedId ? "Editar gasto fijo" : "Nuevo gasto fijo"}</div>
+
+              <form onSubmit={onSaveFixedItem} className="formGrid" style={{ marginTop: 10 }}>
+                <label className="label span2">
+                  ID (opcional)
+                  <input className="input" value={fixedDraft.id} onChange={(e) => setFixedDraft((d) => ({ ...d, id: e.target.value }))} />
+                </label>
+
+                <label className="label span2">
+                  Descripción *
+                  <input className="input" value={fixedDraft.name} onChange={(e) => setFixedDraft((d) => ({ ...d, name: e.target.value }))} />
+                </label>
+
+                <label className="label">
+                  Categoría
+                  <select className="select" value={fixedDraft.category} onChange={(e) => setFixedDraft((d) => ({ ...d, category: e.target.value }))}>
+                    {getExpenseCats_(config).map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="label">
+                  Monto (CLP) *
+                  <input className="input" inputMode="numeric" value={fixedDraft.amount} onChange={(e) => setFixedDraft((d) => ({ ...d, amount: e.target.value }))} />
+                </label>
+
+                <label className="label">
+                  Alcance
+                  <select className="select" value={fixedDraft.scope} onChange={(e) => setFixedDraft((d) => ({ ...d, scope: e.target.value }))}>
+                    <option value="shared">Compartido</option>
+                    <option value="personal">Personal</option>
+                  </select>
+                </label>
+
+                <label className="label">
+                  A quién aplica
+                  <select className="select" value={fixedDraft.appliesTo} onChange={(e) => setFixedDraft((d) => ({ ...d, appliesTo: e.target.value }))}>
+                    <option value="both">Ambos</option>
+                    <option value="pablo">Pablo</option>
+                    <option value="maria_ignacia">María Ignacia</option>
+                  </select>
+                </label>
+
+                <label className="label">
+                  Cuenta
+                  <select className="select" value={fixedDraft.account} onChange={(e) => setFixedDraft((d) => ({ ...d, account: e.target.value }))}>
+                    <option value="balance">Balance General</option>
+                    <option value="personal">Personal</option>
+                    {myGoals.map((g) => (
+                      <option key={g.id} value={`goal:${g.id}`}>{`goal:${g.id}`}</option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="label">
+                  ImpactKey (si compartido)
+                  <select className="select" value={fixedDraft.impactKey} onChange={(e) => setFixedDraft((d) => ({ ...d, impactKey: e.target.value }))}>
+                    {(config?.sharedImpactKeys || ["Casa","Familia","Salud","Vacaciones","DeLosDos"]).map((k) => (
+                      <option key={k} value={k}>{k}</option>
+                    ))}
+                  </select>
+                </label>
+
+                <div className="span2" style={{ display: "flex", gap: 8 }}>
+                  <button className="primary" type="submit" disabled={loading}>
+                    {loading ? "Guardando..." : "Guardar"}
+                  </button>
+                  <button className="secondaryBtn" type="button" onClick={() => resetFixedDraft_()} disabled={loading}>
+                    Limpiar
+                  </button>
+                </div>
+              </form>
+            </div>
+
+            <div className="card">
+              <div className="kpiBig">Listado</div>
+              {fixedItems.length === 0 ? (
+                <div className="meta">No hay gastos fijos aún.</div>
+              ) : (
+                fixedItems.map((fx) => (
+                  <div key={fx.id} className="rowCard">
+                    <div className="rowTop">
+                      <div className="money">{fx.name}</div>
+                      <div className="meta">${formatCLP(fx.amount)} · {fx.category}</div>
+                    </div>
+                    <div className="meta">
+                      id: <b>{fx.id}</b> · scope: {fx.scope} · appliesTo: {fx.appliesTo} · account: {fx.account} · impactKey: {fx.impactKey || "-"}
+                    </div>
+                    <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                      <button className="secondaryBtn" onClick={() => onEditFixedItem(fx)} disabled={loading}>Editar</button>
+                      <button className="dangerBtn" onClick={() => onDeleteFixedItem(fx.id)} disabled={loading}>Eliminar</button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
         {/* HISTORY */}
         {view === VIEWS.HISTORY && (
+
           <div className="grid">
             <div className="card">
               <div className="kpiBig">Historial</div>
@@ -699,8 +1544,12 @@ export default function App() {
                     <div className="meta">{e.date}</div>
                   </div>
                   <div className="meta">
-                    {e.type === "income" ? "Ingreso" : "Gasto"} · {e.category} · {profileName(e.profile)}
+                    {String(e?.nature || "") === "saving"
+                      ? `Ahorro · ${e.category} · ${profileName(e.profile)}`
+                      : `${e.type === "income" ? "Ingreso" : "Gasto"} · ${e.category} · ${profileName(e.profile)}`}
+                    {String(e?.account || "").startsWith("goal:") ? ` · ${String(e.account)}` : ""}
                   </div>
+
                   {e.note ? <div className="meta">{e.note}</div> : null}
                   <button className="danger" onClick={() => onDelete(e.id)} disabled={loading}>
                     Eliminar
@@ -745,25 +1594,95 @@ export default function App() {
           <div className="grid">
             <div className="card">
               <div className="money">Debug</div>
-              <div className="meta">Cambiar perfil + importar JSON a la nube.</div>
+              <div className="meta">Admin local + herramientas (import/export).</div>
 
               <div style={{ marginTop: 12 }}>
-                <div className="kpiSmall">Perfil actual</div>
-                <select className="select" value={profileId} onChange={(e) => setProfileId(e.target.value)}>
-                  {PROFILES.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
-                </select>
+                <div className="kpiSmall">Dispositivo</div>
+                <div className="meta" style={{ marginTop: 4 }}>
+                  DeviceId:{" "}
+                  <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                    {shortId(deviceId)}
+                  </span>
+                </div>
+                <div className="meta" style={{ marginTop: 4 }}>
+                  Perfil nube: <b>{profileLocked ? profileName(profileId) : "No asignado"}</b>
+                  {profileLocked ? " (bloqueado)" : ""}
+                </div>
               </div>
 
-              <div className="adminActions">
+              <div className="adminActions" style={{ marginTop: 12 }}>
+                {!adminUnlocked ? (
+                  <button
+                    className="secondaryBtn"
+                    type="button"
+                    onClick={() => {
+                      if (confirm("¿Desbloquear modo admin en ESTE dispositivo?")) setAdminUnlocked(true);
+                    }}
+                  >
+                    Desbloquear admin (este dispositivo)
+                  </button>
+                ) : (
+                  <button className="secondaryBtn" type="button" onClick={() => setAdminUnlocked(false)}>
+                    Bloquear admin
+                  </button>
+                )}
+              </div>
+
+              {adminUnlocked && (
+                <div style={{ marginTop: 12 }}>
+                  <div className="kpiSmall">Reasignar perfil del dispositivo (escribe en la nube)</div>
+                  <div className="adminActions" style={{ marginTop: 8 }}>
+                    <button
+                      className="danger"
+                      type="button"
+                      disabled={loading}
+                      onClick={async () => {
+                        if (!confirm("Esto cambiará el perfil asignado a este dispositivo en la nube. ¿Continuar?")) return;
+                        try {
+                          setLoading(true);
+                          await registerDeviceProfile({ deviceId, profile: "pablo" });
+                          await syncAll();
+                          alert("Reasignado a Pablo ✅");
+                        } catch (e) {
+                          alert("Error reasignando: " + (e?.message || String(e)));
+                        } finally {
+                          setLoading(false);
+                        }
+                      }}
+                    >
+                      Asignar a Pablo
+                    </button>
+
+                    <button
+                      className="danger"
+                      type="button"
+                      disabled={loading}
+                      onClick={async () => {
+                        if (!confirm("Esto cambiará el perfil asignado a este dispositivo en la nube. ¿Continuar?")) return;
+                        try {
+                          setLoading(true);
+                          await registerDeviceProfile({ deviceId, profile: "maria_ignacia" });
+                          await syncAll();
+                          alert("Reasignado a Maria Ignacia ✅");
+                        } catch (e) {
+                          alert("Error reasignando: " + (e?.message || String(e)));
+                        } finally {
+                          setLoading(false);
+                        }
+                      }}
+                    >
+                      Asignar a Maria Ignacia
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="adminActions" style={{ marginTop: 12 }}>
                 <button className="secondaryBtn" onClick={() => copyToClipboard(JSON.stringify(allEntries, null, 2))}>
                   Copiar JSON
                 </button>
-                <button className="secondaryBtn" onClick={refreshAll} disabled={loading}>
-                  {loading ? "..." : "Recargar nube"}
+                <button className="secondaryBtn" onClick={syncAll} disabled={loading || booting || syncing}>
+                  {loading || booting || syncing ? "..." : "Recargar nube"}
                 </button>
                 <button className="secondaryBtn" onClick={() => fileInputRef.current?.click()} disabled={loading}>
                   Cargar JSON → Reemplazar nube
@@ -794,6 +1713,12 @@ export default function App() {
       <div className="bottomNav" ref={menuRef}>
         {menuOpen && (
           <div className="navMenuBox" role="menu">
+            <button className="navMenuItem" onClick={() => go(VIEWS.SAVINGS)} role="menuitem">
+              Ahorro (Objetivos)
+            </button>
+            <button className="navMenuItem" onClick={() => go(VIEWS.FIXED)} role="menuitem">
+              Gastos fijos
+            </button>
             <button className="navMenuItem" onClick={() => go(VIEWS.HISTORY)} role="menuitem">
               Historial
             </button>
