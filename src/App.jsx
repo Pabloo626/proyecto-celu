@@ -272,15 +272,6 @@ export default function App() {
   const [date, setDate] = useState(today);
     const [note, setNote] = useState("");
 
-
-  // Etiquetado (equidad / privacidad)
-  // scope: personal|shared => define si se ve en ambos y si entra al cálculo de equidad
-  // account: personal|balance => desde dónde se pagó (aportes indirectos)
-  // impactKey: clave normalizada para balance compartido por categoría/objetivo
-  const [scopeSel, setScopeSel] = useState("personal");
-  const [accountSel, setAccountSel] = useState("personal");
-  const [impactKeySel, setImpactKeySel] = useState("");
-
   // Ahorro (Objetivos)
   const [savingGoalId, setSavingGoalId] = useState("");
   const [savingDir, setSavingDir] = useState("in"); // in | out
@@ -480,12 +471,6 @@ export default function App() {
       setAmount("");
       setNote("");
       setCategory(getExpenseCats_(config)[0] || "Otros");
-
-      // defaults de etiquetado (modelo nuevo)
-      setScopeSel("personal");
-      setAccountSel("personal");
-      const firstImpact = (config?.sharedImpactKeys?.[0]) || "Casa";
-      setImpactKeySel(firstImpact);
     }
 
     if (to === VIEWS.SAVINGS) {
@@ -557,8 +542,6 @@ export default function App() {
     }
 
     for (const e of allEntries) {
-      // Privacidad: solo movimientos propios o compartidos
-      if (e.profile !== profileId && String(e?.scope || "") !== "shared") continue;
       if (String(e?.nature || "") !== "saving") continue;
 
       const acc = String(e?.account || "");
@@ -627,8 +610,7 @@ export default function App() {
     setLoading(true);
     setErr("");
     try {
-      await addEntry(debit);
-      await addEntry(credit);
+      await addEntry(entry);
       await refreshAll();
       go(VIEWS.SAVINGS);
       setSavingAmount("");
@@ -731,9 +713,7 @@ export default function App() {
   }
 
   function entryKey_(e) {
-    const scope = String(e?.scope || "") === "shared" ? "shared" : "personal";
-    const p = scope === "shared" ? "*" : String(e?.profile || "");
-    return `${p}|${e.date}|${e.fixedId}|${e.amount}|${e.category}|${e.nature}|${e.account}|${e.direction}`;
+    return `${e.profile}|${e.date}|${e.fixedId}|${e.amount}|${e.category}|${e.nature}|${e.account}|${e.direction}`;
   }
 
   async function onGenerateFixedForMonth() {
@@ -754,15 +734,10 @@ export default function App() {
 
     for (const fx of targets) {
       const applies = String(fx.appliesTo || "both");
-      const scope = fx.scope === "personal" ? "personal" : "shared";
-
-      // Para shared: una sola fila en Entries (se muestra en ambos por scope)
-      // Para personal: respeta appliesTo (pablo/maria_ignacia/both)
-      const profiles = scope === "shared"
-        ? [(applies === "maria_ignacia") ? "maria_ignacia" : "pablo"]
-        : (applies === "both" ? ["pablo", "maria_ignacia"] : [applies]);
+      const profiles = applies === "both" ? ["pablo", "maria_ignacia"] : [applies];
 
       for (const pid of profiles) {
+        const scope = fx.scope === "personal" ? "personal" : "shared";
         const impactKey = scope === "shared" ? String(fx.impactKey || fx.category || "") : "";
 
         const entry = {
@@ -818,64 +793,30 @@ export default function App() {
     const amt = parseAmount(prompt(`¿Cuánto mover desde "${goal.name}" a Balance General? (CLP)`));
     if (!amt) return;
 
-    // Si el objetivo es personal, preguntamos si el movimiento debe considerarse compartido.
-    // (Esto afecta la privacidad y el cálculo de equidad.)
-    const creditScope = goal.scope === "shared"
-      ? "shared"
-      : (confirm("¿Este movimiento debe entrar al balance compartido (De los dos)?") ? "shared" : "personal");
-
-    const now = new Date().toISOString();
-    const today = todayISODateLocal();
-
-    // 1) Débito desde el objetivo (mantiene el flujo interno del objetivo)
-    const debit = {
+    const entry = {
       id: uid(),
       type: ENTRY_TYPES.EXPENSE,
       amount: amt,
       category: String(goal.name || "Ahorro"),
       profile: profileId,
-      date: today,
-      note: "Mover a Balance General (salida desde objetivo)",
+      date: todayISODateLocal(),
+      note: "Mover a Balance General",
       split: null,
-      createdAt: now,
+      createdAt: new Date().toISOString(),
 
       nature: "saving",
       scope: goal.scope === "shared" ? "shared" : "personal",
       account: `goal:${goal.id}`,
       direction: "out",
-      impactKey: (goal.scope === "shared") ? (impactKeyForGoal_(goal) || "") : "",
+      impactKey: impactKeyForGoal_(goal) || "",
       fixedId: "",
-      meta: JSON.stringify({ moveTo: "balance", kind: "debit" }),
-    };
-
-    // 2) Crédito al Balance General (solo si corresponde)
-    // - Mantiene nature="saving" para no inflar ingresos
-    // - scope compartido => visible en ambos y entra al cálculo de equidad
-    const credit = {
-      id: uid(),
-      type: ENTRY_TYPES.INCOME,
-      amount: amt,
-      category: String(goal.name || "Ahorro"),
-      profile: profileId,
-      date: today,
-      note: "Mover a Balance General (entrada a balance)",
-      split: null,
-      createdAt: now,
-
-      nature: "saving",
-      scope: creditScope,
-      account: "balance",
-      direction: "in",
-      impactKey: creditScope === "shared" ? (impactKeyForGoal_(goal) || "") : "",
-      fixedId: "",
-      meta: JSON.stringify({ moveTo: "balance", kind: "credit" }),
+      meta: JSON.stringify({ moveTo: "balance" }),
     };
 
     setLoading(true);
     setErr("");
     try {
-      await addEntry(debit);
-      await addEntry(credit);
+      await addEntry(entry);
       await refreshAll();
       go(VIEWS.SAVINGS);
     } catch (e) {
@@ -887,7 +828,7 @@ export default function App() {
   }
 
   const myEntriesMonth = useMemo(
-    () => entriesMonth.filter((e) => e.profile === profileId || String(e?.scope || "") === "shared"),
+    () => entriesMonth.filter((e) => e.profile === profileId),
     [entriesMonth, profileId]
   );
 
@@ -896,7 +837,7 @@ export default function App() {
       myEntriesMonth.filter((e) => {
         // mantener compatibilidad con legacy: si no hay nature, usar type
         const nature = String(e?.nature || "");
-        if (nature) return nature === "expense" || nature === "fixed";
+        if (nature) return nature === "expense";
         return e.type === ENTRY_TYPES.EXPENSE;
       }),
     [myEntriesMonth]
@@ -1002,36 +943,26 @@ export default function App() {
     for (const m of availableMonths) out.set(m, { income: 0, expense: 0 });
 
     for (const e of allEntries) {
-      const isShared = String(e?.scope || "") === "shared";
-      if (e.profile !== profileId && !isShared) continue;
-
+      if (e.profile !== profileId) continue;
       const m = monthKeyFromISODate(e.date);
       if (!out.has(m)) out.set(m, { income: 0, expense: 0 });
       const bucket = out.get(m);
-
-      const nature = String(e?.nature || "");
-      if (nature) {
-        if (nature === "income") bucket.income += Number(e.amount || 0);
-        else if (nature === "expense" || nature === "fixed") bucket.expense += Number(e.amount || 0);
-        // saving no entra en income/expense de snapshot
-      } else {
-        if (e.type === ENTRY_TYPES.INCOME) bucket.income += Number(e.amount || 0);
-        else bucket.expense += Number(e.amount || 0);
-      }
+      if (e.type === ENTRY_TYPES.INCOME) bucket.income += Number(e.amount || 0);
+      else bucket.expense += Number(e.amount || 0);
     }
     return out;
   }, [allEntries, profileId, availableMonths]);
 
   /* ---------- Historial ---------- */
   const allSorted = useMemo(() => {
-    const copy = allEntries.filter((e) => e.profile === profileId || String(e?.scope || "") === "shared");
+    const copy = [...allEntries];
     copy.sort(
       (a, b) =>
         (b.date || "").localeCompare(a.date || "") ||
         (b.createdAt || "").localeCompare(a.createdAt || "")
     );
     return copy;
-  }, [allEntries, profileId]);
+  }, [allEntries]);
 
   /* ---------- Actions ---------- */
   async function onSubmit(e) {
@@ -1047,15 +978,6 @@ export default function App() {
 
 
 
-    const scope = scopeSel === "shared" ? "shared" : "personal";
-    const account = String(accountSel || (entryType === ENTRY_TYPES.INCOME ? "personal" : "personal"));
-    const direction = entryType === ENTRY_TYPES.INCOME ? "in" : "out";
-    const nature = entryType === ENTRY_TYPES.INCOME ? "income" : "expense";
-
-    // Regla: si es compartido, debe tener impactKey
-    const impactKey = scope === "shared" ? String(impactKeySel || "").trim() : "";
-    if (scope === "shared" && !impactKey) return alert("Falta Impacto (impactKey) para movimiento compartido.");
-
     const entry = {
       id: uid(),
       type: entryType,
@@ -1064,17 +986,8 @@ export default function App() {
       profile: profileId,
       date,
       note: note.trim(),
-      split: null, // el modelo nuevo no depende de split
+      split: entryType === ENTRY_TYPES.EXPENSE ? "50_50" : null,
       createdAt: new Date().toISOString(),
-
-      // Nuevo etiquetado
-      nature,
-      scope,
-      account,
-      direction,
-      impactKey,
-      fixedId: "",
-      meta: "",
     };
 
     setLoading(true);
@@ -1170,30 +1083,25 @@ export default function App() {
 
   return (
     <>
-      <div className="appHeader">
-        <div className="appHeaderInner">
-          <div className="topBar" />
-        </div>
-      </div>
-
       <div className="container">
-        {/* Header nube */}
-        <div className="card" style={{ marginBottom: 12 }}>
-          <div className="chartTitleRow">
-            <div>
-              <div className="kpiBig">Nube (Google Sheets)</div>
-              <div className="kpiSmall">
-                Mes: <b>{selectedMonth}</b> · Perfil: <b>{profileLocked ? profileName(profileId) : "Sin asignar"}</b>{profileLocked ? " 🔒" : ""} · Dispositivo: <b>{shortId(deviceId)}</b> · Tema: <b>{theme}</b>
-              </div>
+        {/* Barra de estado (no fija): contexto + sync */}
+        <div className="statusBar" style={{ marginBottom: 12 }}>
+          <div className="statusLeft">
+            <div className="statusTitle">{view === VIEWS.PROFILE ? "Resumen" : view === VIEWS.ADD ? "Agregar" : view === VIEWS.SAVINGS ? "Ahorro" : view === VIEWS.FIXED ? "Gastos fijos" : view === VIEWS.HISTORY ? "Historial" : view === VIEWS.MONTHS ? "Meses" : view === VIEWS.DEBUG ? "Admin" : ""}</div>
+            <div className="statusMeta">
+              <span>Mes <b>{selectedMonth}</b></span>
+              <span className="dotSep">•</span>
+              <span>Perfil <b>{profileLocked ? profileName(profileId) : "Sin asignar"}</b>{profileLocked ? " 🔒" : ""}</span>
+              <span className="dotSep">•</span>
+              <span>Sync <b>{loading ? "…" : (lastSyncAt ? new Date(lastSyncAt).toLocaleTimeString() : "—")}</b></span>
             </div>
-            <div style={{ textAlign: "right" }}>
-              <button className="secondaryBtn" onClick={syncAll} disabled={loading}>
-                {loading ? "Sincronizando..." : "Sincronizar"}
-              </button>
-              <div className="small" style={{ marginTop: 6 }}>
-                {err ? `Error: ${err}` : lastSyncAt ? `Última sync: ${new Date(lastSyncAt).toLocaleString()}` : "—"}
-              </div>
-            </div>
+          </div>
+
+          <div className="statusRight">
+            <button className="secondaryBtn smallBtn" onClick={syncAll} disabled={loading}>
+              {loading ? "Sincronizando…" : "Sincronizar"}
+            </button>
+            <div className="statusErr">{err ? `Error: ${err}` : ""}</div>
           </div>
         </div>
 
@@ -1354,11 +1262,9 @@ export default function App() {
               <SegmentedType value={entryType} onChange={setEntryType} />
               <div className="meta">
                 Se guardará en: <b>{profileName(profileId)}</b>
-                {scopeSel === "shared" ? <span> · Visible en ambos (Compartido)</span> : <span> · Solo tú (Personal)</span>}
               </div>
 
               <form onSubmit={onSubmit} className="formGrid" style={{ marginTop: 10 }}>
-
                 <label className="label span2">
                   Monto (CLP) *
                   <input className="input" inputMode="numeric" value={amount} onChange={(e) => setAmount(e.target.value)} />
@@ -1379,35 +1285,6 @@ export default function App() {
                   Fecha
                   <input className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
                 </label>
-
-                <label className="label">
-                  Alcance
-                  <select className="select" value={scopeSel} onChange={(e) => setScopeSel(e.target.value)}>
-                    <option value="personal">Personal</option>
-                    <option value="shared">Compartido (De los dos)</option>
-                  </select>
-                </label>
-
-                <label className="label">
-                  Desde
-                  <select className="select" value={accountSel} onChange={(e) => setAccountSel(e.target.value)}>
-                    <option value="personal">Personal</option>
-                    <option value="balance">Balance general</option>
-                  </select>
-                </label>
-
-                {scopeSel === "shared" && (
-                  <label className="label span2">
-                    Impacto (impactKey)
-                    <select className="select" value={impactKeySel} onChange={(e) => setImpactKeySel(e.target.value)}>
-                      {(config?.sharedImpactKeys || ["Casa", "Familia", "Salud", "Vacaciones", "DeLosDos"]).map((k) => (
-                        <option key={k} value={k}>
-                          {k}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                )}
 
                 <label className="label span2">
                   Nota (opcional)
