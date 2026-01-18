@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { getConfig, registerDeviceProfile, addEntry, deleteEntry, listEntries, listMonths, replaceAll } from "./api";
+import { getConfig, setConfig, registerDeviceProfile, addEntry, deleteEntry, listEntries, listMonths, replaceAll } from "./api";
 
 
-/* =========================================================
+/* =================================================
    1) CONFIG
    ========================================================= */
 const VIEWS = {
   SETUP: "setup",
   PROFILE: "profile",
+  SHARED: "shared",
   ADD: "add",
   SAVINGS: "savings",
   FIXED: "fixed",
@@ -393,7 +394,7 @@ export default function App() {
       if (assigned && PROFILES.some((p) => p.id === assigned)) {
         setProfileId(assigned);
         setProfileLocked(true);
-        setView((v) => (v === VIEWS.SETUP ? VIEWS.PROFILE : v));
+        setView((v) => (v === VIEWS.SETUP ? VIEWS.ADD : v));
       } else {
         setProfileLocked(false);
         setView((v) => (v === VIEWS.DEBUG ? v : VIEWS.SETUP));
@@ -871,6 +872,40 @@ export default function App() {
 
   const myMaxCat = useMemo(() => Math.max(0, ...myTopExpenseCategories.map((x) => x.value)), [myTopExpenseCategories]);
 
+  // Compartido (agregado): solo scope="shared". Se usa para vista de pareja sin exponer detalles personales.
+  const sharedOutMonth = useMemo(() => {
+    return entriesMonth
+      .filter((e) => String(e?.scope || "") === "shared")
+      .filter((e) => String(e?.direction || (e.type === ENTRY_TYPES.INCOME ? "in" : "out")) === "out");
+  }, [entriesMonth]);
+
+  const sharedTotalOut = useMemo(() => sumAmounts(sharedOutMonth), [sharedOutMonth]);
+
+  // Aporte indirecto: cuando el gasto compartido NO se paga desde balance (account!="balance")
+  const mySharedIndirectOut = useMemo(() => {
+    return sumAmounts(
+      sharedOutMonth.filter((e) => e.profile === profileId && String(e?.account || "personal") !== "balance")
+    );
+  }, [sharedOutMonth, profileId]);
+
+  const sharedByImpact = useMemo(() => {
+    const map = new Map();
+    for (const e of sharedOutMonth) {
+      const k = String(e?.impactKey || e?.category || "Otros");
+      map.set(k, (map.get(k) || 0) + Number(e.amount || 0));
+    }
+    return [...map.entries()]
+      .map(([label, value]) => ({ label, value }))
+      .sort((a, b) => b.value - a.value);
+  }, [sharedOutMonth]);
+
+  const sharedMax = useMemo(() => Math.max(0, ...sharedByImpact.map((x) => x.value)), [sharedByImpact]);
+
+  const mySharedRatio = useMemo(() => {
+    if (!sharedTotalOut) return 0;
+    return mySharedIndirectOut / sharedTotalOut;
+  }, [mySharedIndirectOut, sharedTotalOut]);
+
   // Presupuestos de ejemplo (% del ingreso del mes por perfil)
     // Presupuestos desde la nube (config.budgets) en % 0..100 => fracción 0..1
   const budgetPercents = useMemo(() => {
@@ -955,7 +990,7 @@ export default function App() {
 
   /* ---------- Historial ---------- */
   const allSorted = useMemo(() => {
-    const copy = [...allEntries];
+    const copy = allEntries.filter((e) => e.profile === profileId || String(e?.scope || "") === "shared");
     copy.sort(
       (a, b) =>
         (b.date || "").localeCompare(a.date || "") ||
@@ -1087,7 +1122,7 @@ export default function App() {
         {/* Barra de estado (no fija): contexto + sync */}
         <div className="statusBar" style={{ marginBottom: 12 }}>
           <div className="statusLeft">
-            <div className="statusTitle">{view === VIEWS.PROFILE ? "Resumen" : view === VIEWS.ADD ? "Agregar" : view === VIEWS.SAVINGS ? "Ahorro" : view === VIEWS.FIXED ? "Gastos fijos" : view === VIEWS.HISTORY ? "Historial" : view === VIEWS.MONTHS ? "Meses" : view === VIEWS.DEBUG ? "Admin" : ""}</div>
+            <div className="statusTitle">{view === VIEWS.PROFILE ? "Inicio" : view === VIEWS.SHARED ? "Compartido" : view === VIEWS.ADD ? "Agregar" : view === VIEWS.SAVINGS ? "Ahorro" : view === VIEWS.FIXED ? "Gastos fijos" : view === VIEWS.HISTORY ? "Historial" : view === VIEWS.MONTHS ? "Meses" : view === VIEWS.DEBUG ? "Admin" : ""}</div>
             <div className="statusMeta">
               <span>Mes <b>{selectedMonth}</b></span>
               <span className="dotSep">•</span>
@@ -1101,6 +1136,7 @@ export default function App() {
             <button className="secondaryBtn smallBtn" onClick={syncAll} disabled={loading}>
               {loading ? "Sincronizando…" : "Sincronizar"}
             </button>
+            <button className="iconBtn" onClick={() => setMenuOpen((v) => !v)} aria-label="Más">⋯</button>
             <div className="statusErr">{err ? `Error: ${err}` : ""}</div>
           </div>
         </div>
@@ -1249,6 +1285,59 @@ export default function App() {
                 <div className="small" style={{ marginTop: 6 }}>
                   Movimientos anteriores: {pastNet.count} · Ingresos: +${formatCLP(pastNet.income)} · Gastos: -${formatCLP(pastNet.expense)}
                 </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+
+        {/* SHARED */}
+        {view === VIEWS.SHARED && (
+          <div className="grid">
+            <div className="card">
+              <div className="kpiBig">Compartido · {selectedMonth}</div>
+              <div className="meta">
+                Vista agregada de movimientos con <b>scope=shared</b>. No muestra el detalle personal del otro perfil.
+              </div>
+            </div>
+
+            <div className="card grid">
+              <div className="chartTitleRow">
+                <div>
+                  <div className="kpiBig">Gasto compartido del mes</div>
+                  <div className="kpiSmall">Total de salidas compartidas</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div className="kpiBig">-${formatCLP(sharedTotalOut)}</div>
+                  <div className="kpiSmall">Total</div>
+                </div>
+              </div>
+
+              <div className="card">
+                <div className="kpiBig">Tu aporte indirecto</div>
+                <div className="meta" style={{ marginTop: 6 }}>
+                  Suma de gastos compartidos pagados desde <b>Personal</b> o <b>Objetivos</b> (account != balance).
+                </div>
+                <div className="meta" style={{ marginTop: 10 }}>
+                  Este mes: <b>-${formatCLP(mySharedIndirectOut)}</b> · Proporción sobre total: <b>{Math.round(mySharedRatio * 100)}%</b>
+                </div>
+                <div className="small" style={{ marginTop: 6 }}>
+                  Nota: la equidad porcentual por ingresos se implementará en la siguiente etapa; por ahora esto es una vista de distribución agregada.
+                </div>
+              </div>
+
+              <div className="barsWrap">
+                <div className="kpiSmall">Compartido por categoría/impactKey</div>
+                {sharedByImpact.length === 0 ? (
+                  <div className="kpiSmall" style={{ marginTop: 10 }}>Sin movimientos compartidos este mes.</div>
+                ) : (
+                  <CategoryBars rows={sharedByImpact} maxValue={sharedMax} />
+                )}
+              </div>
+
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <button className="secondaryBtn" onClick={() => go(VIEWS.ADD)} disabled={loading}>Agregar movimiento</button>
+                <button className="secondaryBtn" onClick={() => go(VIEWS.HISTORY)} disabled={loading}>Ver historial (agregado)</button>
               </div>
             </div>
           </div>
@@ -1679,41 +1768,24 @@ export default function App() {
         )}
       </div>
 
-      {/* Bottom nav */}
-      <div className="bottomNav" ref={menuRef}>
-        {menuOpen && (
-          <div className="navMenuBox" role="menu">
-            <button className="navMenuItem" onClick={() => go(VIEWS.SAVINGS)} role="menuitem">
-              Ahorro (Objetivos)
-            </button>
-            <button className="navMenuItem" onClick={() => go(VIEWS.FIXED)} role="menuitem">
-              Gastos fijos
-            </button>
-            <button className="navMenuItem" onClick={() => go(VIEWS.HISTORY)} role="menuitem">
-              Historial
-            </button>
-            <button className="navMenuItem" onClick={() => go(VIEWS.MONTHS)} role="menuitem">
-              Meses pasados
-            </button>
-            <button className="navMenuItem" onClick={() => go(VIEWS.DEBUG)} role="menuitem">
-              Debug
-            </button>
-            <button className="navMenuItem" onClick={toggleTheme} role="menuitem">
-              Cambiar tema ({theme === "light" ? "🌙" : "☀️"})
-            </button>
-          </div>
-        )}
+      {/* Menú contextual (más) */}
+      {menuOpen && (
+        <div className="statusMenuBox" role="menu" ref={menuRef}>
+          <button className="navMenuItem" onClick={() => go(VIEWS.HISTORY)} role="menuitem">Historial</button>
+          <button className="navMenuItem" onClick={() => go(VIEWS.MONTHS)} role="menuitem">Meses pasados</button>
+          <button className="navMenuItem" onClick={() => go(VIEWS.DEBUG)} role="menuitem">Debug</button>
+          <button className="navMenuItem" onClick={toggleTheme} role="menuitem">Cambiar tema ({theme === "light" ? "🌙" : "☀️"})</button>
+        </div>
+      )}
 
+      {/* Bottom nav */}
+      <div className="bottomNav">
         <div className="bottomNavInner">
-          <button className="navBtn" onClick={() => setMenuOpen((s) => !s)} aria-label="Opciones">
-            ☰
-          </button>
-          <button className="navBtn navBtnPrimary" onClick={() => go(VIEWS.ADD)} aria-label="Agregar">
-            +
-          </button>
-          <button className={`navBtn ${view === VIEWS.PROFILE ? "isActive" : ""}`} onClick={() => go(VIEWS.PROFILE)} aria-label="Perfil">
-            👤
-          </button>
+          <button className={`navBtn ${view === VIEWS.PROFILE ? "isActive" : ""}`} onClick={() => go(VIEWS.PROFILE)} aria-label="Inicio">⌂</button>
+          <button className={`navBtn ${view === VIEWS.SHARED ? "isActive" : ""}`} onClick={() => go(VIEWS.SHARED)} aria-label="Compartido">🤝</button>
+          <button className="navBtn navBtnPrimary" onClick={() => go(VIEWS.ADD)} aria-label="Agregar">+</button>
+          <button className={`navBtn ${view === VIEWS.SAVINGS ? "isActive" : ""}`} onClick={() => go(VIEWS.SAVINGS)} aria-label="Ahorro">🏦</button>
+          <button className={`navBtn ${view === VIEWS.FIXED ? "isActive" : ""}`} onClick={() => go(VIEWS.FIXED)} aria-label="Fijos">⟲</button>
         </div>
       </div>
     </>
